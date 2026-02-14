@@ -178,6 +178,18 @@
     .end-btn:hover { border-color: #6a6560; color: #9a968f; }
     .end-btn.visible { display: inline-block; }
 
+    /* ---- Hidden widget ---- */
+    .widget-hidden {
+      position: fixed;
+      top: -9999px;
+      left: -9999px;
+      opacity: 0;
+      pointer-events: none;
+      width: 0;
+      height: 0;
+      overflow: hidden;
+    }
+
     /* ---- Lower content ---- */
     .divider {
       width: 40px;
@@ -227,6 +239,18 @@
 <body>
   <div class="bg-glow"></div>
 
+  <!-- Hidden ElevenLabs widget — handles WebRTC, audio, echo cancellation -->
+  <div class="widget-hidden" id="widgetWrapper">
+    <elevenlabs-convai
+      agent-id="agent_9501khf35mehe308835dqpqe373j"
+      listening-text="__NYT_LISTENING__"
+      speaking-text="__NYT_SPEAKING__"
+      action-text="__NYT_START__"
+      start-call-text="__NYT_STARTING__"
+      end-call-text="__NYT_END__"
+    ></elevenlabs-convai>
+  </div>
+
   <main>
     <h1>You are not <em>your thoughts</em></h1>
 
@@ -260,24 +284,20 @@
     <p>This is not therapy. If you're in crisis, please reach out to a professional.</p>
   </footer>
 
+  <script src="https://unpkg.com/@elevenlabs/convai-widget-embed" async type="text/javascript"></script>
   <script>
-    const AGENT_ID = 'agent_9501khf35mehe308835dqpqe373j';
-    const WS_URL = `wss://api.elevenlabs.io/v1/convai/conversation?agent_id=${AGENT_ID}`;
-
     const orbContainer = document.getElementById('orbContainer');
     const orbLabel = document.getElementById('orbLabel');
     const endBtn = document.getElementById('endBtn');
+    const widgetWrapper = document.getElementById('widgetWrapper');
+    const widget = document.querySelector('elevenlabs-convai');
 
-    let ws = null;
-    let audioContext = null;
-    let micStream = null;
-    let processor = null;
-    let state = 'idle'; // idle | connecting | listening | speaking
-    let nextPlayTime = 0;
-    let audioFormat = 'pcm_16000'; // default, updated from server metadata
-    let outputSampleRate = 16000;
+    let state = 'idle';
+    let statePoller = null;
 
+    // ---- State management for the orb UI ----
     function setState(newState) {
+      if (state === newState) return;
       state = newState;
       orbContainer.className = 'orb-container';
       orbLabel.className = 'orb-label';
@@ -310,196 +330,167 @@
       }
     }
 
-    // ---- Base64 helpers ----
-    function arrayBufferToBase64(buffer) {
-      const bytes = new Uint8Array(buffer);
-      let binary = '';
-      for (let i = 0; i < bytes.length; i++) {
-        binary += String.fromCharCode(bytes[i]);
-      }
-      return btoa(binary);
+    // ---- Shadow DOM helpers ----
+    function getWidgetShadow() {
+      return widget ? widget.shadowRoot : null;
     }
 
-    function base64ToArrayBuffer(base64) {
-      const binary = atob(base64);
-      const bytes = new Uint8Array(binary.length);
-      for (let i = 0; i < binary.length; i++) {
-        bytes[i] = binary.charCodeAt(i);
-      }
-      return bytes.buffer;
-    }
-
-    // ---- Audio playback ----
-    function playPcmChunk(base64Audio) {
-      if (!audioContext) return;
-      const buffer = base64ToArrayBuffer(base64Audio);
-      const int16 = new Int16Array(buffer);
-      const float32 = new Float32Array(int16.length);
-      for (let i = 0; i < int16.length; i++) {
-        float32[i] = int16[i] / 32768;
-      }
-      const audioBuffer = audioContext.createBuffer(1, float32.length, outputSampleRate);
-      audioBuffer.getChannelData(0).set(float32);
-
-      const source = audioContext.createBufferSource();
-      source.buffer = audioBuffer;
-      source.connect(audioContext.destination);
-
-      const startTime = Math.max(audioContext.currentTime + 0.05, nextPlayTime);
-      source.start(startTime);
-      nextPlayTime = startTime + audioBuffer.duration;
-    }
-
-    async function playEncodedChunk(base64Audio) {
-      if (!audioContext) return;
-      try {
-        const buffer = base64ToArrayBuffer(base64Audio);
-        const audioBuffer = await audioContext.decodeAudioData(buffer.slice(0));
-        const source = audioContext.createBufferSource();
-        source.buffer = audioBuffer;
-        source.connect(audioContext.destination);
-        const startTime = Math.max(audioContext.currentTime + 0.05, nextPlayTime);
-        source.start(startTime);
-        nextPlayTime = startTime + audioBuffer.duration;
-      } catch (e) {
-        // Fallback: try as PCM
-        playPcmChunk(base64Audio);
-      }
-    }
-
-    function handleAudioChunk(base64Audio) {
-      if (state !== 'speaking') setState('speaking');
-      if (audioFormat.startsWith('pcm')) {
-        playPcmChunk(base64Audio);
-      } else {
-        playEncodedChunk(base64Audio);
-      }
-    }
-
-    // ---- Mic capture ----
-    function startMicCapture() {
-      if (!micStream || !audioContext) return;
-      const source = audioContext.createMediaStreamSource(micStream);
-
-      // ScriptProcessor: 4096 samples, mono in, mono out
-      processor = audioContext.createScriptProcessor(4096, 1, 1);
-      source.connect(processor);
-      processor.connect(audioContext.destination);
-
-      processor.onaudioprocess = (e) => {
-        if (!ws || ws.readyState !== WebSocket.OPEN) return;
-        const input = e.inputBuffer.getChannelData(0);
-        // Resample to 16kHz if needed
-        const ratio = audioContext.sampleRate / 16000;
-        const outputLength = Math.floor(input.length / ratio);
-        const pcm16 = new Int16Array(outputLength);
-        for (let i = 0; i < outputLength; i++) {
-          const idx = Math.floor(i * ratio);
-          pcm16[i] = Math.max(-32768, Math.min(32767, Math.floor(input[idx] * 32768)));
+    function findButtonByText(shadow, marker) {
+      if (!shadow) return null;
+      // Search all elements for text matching the marker
+      const walker = document.createTreeWalker(shadow, NodeFilter.SHOW_ELEMENT);
+      let node;
+      while (node = walker.nextNode()) {
+        if (node.textContent && node.textContent.includes(marker)) {
+          // Prefer actual buttons
+          if (node.tagName === 'BUTTON') return node;
+          // Check if it's clickable
+          if (node.getAttribute('role') === 'button' || node.onclick || node.style.cursor === 'pointer') return node;
         }
-        const base64 = arrayBufferToBase64(pcm16.buffer);
-        ws.send(JSON.stringify({ user_audio_chunk: base64 }));
-      };
+      }
+      // Fallback: find any button whose text includes the marker
+      const buttons = shadow.querySelectorAll('button');
+      for (const btn of buttons) {
+        if (btn.textContent && btn.textContent.includes(marker)) return btn;
+      }
+      return null;
     }
 
-    // ---- WebSocket ----
-    function connectWS() {
-      ws = new WebSocket(WS_URL);
+    function findAnyClickable(shadow) {
+      if (!shadow) return null;
+      // Find the first button or clickable-looking element
+      const btn = shadow.querySelector('button');
+      if (btn) return btn;
+      const divBtn = shadow.querySelector('[role="button"]');
+      if (divBtn) return divBtn;
+      // Last resort: any div with onclick or cursor pointer
+      const all = shadow.querySelectorAll('div, span');
+      for (const el of all) {
+        const style = getComputedStyle(el);
+        if (style.cursor === 'pointer') return el;
+      }
+      return null;
+    }
 
-      ws.onopen = () => {
-        ws.send(JSON.stringify({
-          type: 'conversation_initiation_client_data',
-          conversation_config_override: {
-            agent: { language: 'en' }
-          }
-        }));
-        startMicCapture();
-        setState('listening');
-      };
+    // ---- Detect widget conversation state from shadow DOM ----
+    function detectWidgetState() {
+      const shadow = getWidgetShadow();
+      if (!shadow) return 'unknown';
+      const text = shadow.textContent || '';
+      if (text.includes('__NYT_SPEAKING__')) return 'speaking';
+      if (text.includes('__NYT_LISTENING__')) return 'listening';
+      if (text.includes('__NYT_STARTING__')) return 'connecting';
+      if (text.includes('__NYT_END__')) return 'active'; // end button visible = call in progress
+      if (text.includes('__NYT_START__')) return 'idle';
+      return 'unknown';
+    }
 
-      ws.onmessage = (event) => {
-        const data = JSON.parse(event.data);
-        switch (data.type) {
-          case 'conversation_initiation_metadata':
-            if (data.conversation_initiation_metadata_event) {
-              const meta = data.conversation_initiation_metadata_event;
-              if (meta.agent_output_audio_format) {
-                audioFormat = meta.agent_output_audio_format;
-                const rateMatch = audioFormat.match(/(\d+)/);
-                if (rateMatch) outputSampleRate = parseInt(rateMatch[1], 10);
-              }
-            }
+    function startStatePolling() {
+      if (statePoller) return;
+      statePoller = setInterval(() => {
+        const widgetState = detectWidgetState();
+        switch (widgetState) {
+          case 'speaking':
+            setState('speaking');
             break;
-          case 'audio':
-            if (data.audio_event && data.audio_event.audio_base_64) {
-              handleAudioChunk(data.audio_event.audio_base_64);
-            }
-            break;
-          case 'agent_response':
-            if (state !== 'speaking') setState('speaking');
-            break;
-          case 'user_transcript':
-            if (state !== 'listening') setState('listening');
-            break;
-          case 'interruption':
-            nextPlayTime = 0;
+          case 'listening':
             setState('listening');
             break;
-          case 'ping':
-            if (data.ping_event) {
-              const { event_id, ping_ms } = data.ping_event;
-              setTimeout(() => {
-                if (ws && ws.readyState === WebSocket.OPEN) {
-                  ws.send(JSON.stringify({ type: 'pong', event_id }));
-                }
-              }, ping_ms);
-            }
+          case 'connecting':
+            setState('connecting');
             break;
-          case 'agent_response_correction':
+          case 'active':
+            // In call but couldn't determine listening/speaking — default to listening
+            if (state !== 'speaking') setState('listening');
+            break;
+          case 'idle':
+            setState('idle');
+            stopStatePolling();
             break;
         }
-      };
-
-      ws.onclose = () => {
-        cleanup();
-        setState('idle');
-      };
-
-      ws.onerror = () => {
-        cleanup();
-        setState('idle');
-        orbLabel.textContent = 'Connection failed — tap to retry';
-      };
+      }, 200);
     }
 
-    // ---- Lifecycle ----
+    function stopStatePolling() {
+      if (statePoller) {
+        clearInterval(statePoller);
+        statePoller = null;
+      }
+    }
+
+    // ---- Wait for widget shadow DOM to be ready ----
+    function waitForWidgetReady(timeout = 5000) {
+      return new Promise((resolve, reject) => {
+        const start = Date.now();
+        const check = () => {
+          const shadow = getWidgetShadow();
+          if (shadow) return resolve(shadow);
+          if (Date.now() - start > timeout) return reject(new Error('Widget not ready'));
+          requestAnimationFrame(check);
+        };
+        check();
+      });
+    }
+
+    // ---- Pre-warm mic permission (needs user gesture) ----
+    async function ensureMicPermission() {
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        stream.getTracks().forEach(t => t.stop());
+        return true;
+      } catch {
+        return false;
+      }
+    }
+
+    // ---- Start conversation ----
     async function startConversation() {
       if (state !== 'idle') return;
       setState('connecting');
 
-      try {
-        micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
-        audioContext = new AudioContext();
-        nextPlayTime = 0;
-        connectWS();
-      } catch (e) {
+      // 1. Get mic permission while we have the user gesture
+      const hasMic = await ensureMicPermission();
+      if (!hasMic) {
         setState('idle');
         orbLabel.textContent = 'Microphone needed — tap to retry';
+        return;
+      }
+
+      // 2. Make widget wrapper visible enough to function
+      widgetWrapper.style.pointerEvents = 'auto';
+
+      try {
+        // 3. Wait for widget shadow DOM
+        const shadow = await waitForWidgetReady();
+
+        // 4. Find the start button in the widget
+        let startBtn = findButtonByText(shadow, '__NYT_START__');
+        if (!startBtn) startBtn = findAnyClickable(shadow);
+
+        if (startBtn) {
+          startBtn.click();
+          startStatePolling();
+        } else {
+          throw new Error('Could not find widget button');
+        }
+      } catch (e) {
+        setState('idle');
+        orbLabel.textContent = 'Connection failed — tap to retry';
+        widgetWrapper.style.pointerEvents = 'none';
       }
     }
 
+    // ---- End conversation ----
     function endConversation() {
-      if (ws) ws.close();
-      cleanup();
+      const shadow = getWidgetShadow();
+      if (shadow) {
+        let endButton = findButtonByText(shadow, '__NYT_END__');
+        if (!endButton) endButton = findAnyClickable(shadow);
+        if (endButton) endButton.click();
+      }
+      stopStatePolling();
       setState('idle');
-    }
-
-    function cleanup() {
-      if (processor) { processor.disconnect(); processor = null; }
-      if (micStream) { micStream.getTracks().forEach(t => t.stop()); micStream = null; }
-      if (audioContext) { audioContext.close().catch(() => {}); audioContext = null; }
-      ws = null;
-      nextPlayTime = 0;
+      widgetWrapper.style.pointerEvents = 'none';
     }
 
     // ---- Event listeners ----
